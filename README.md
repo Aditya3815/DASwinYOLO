@@ -27,11 +27,11 @@ SwinYOLO improves upon the baseline YOLOv5s architecture through five fundamenta
 
 ```mermaid
 graph TD
-    classDef input fill:#f9f9f9,stroke:#333,stroke-width:2px;
-    classDef backbone fill:#d4edda,stroke:#28a745,stroke-width:2px;
-    classDef swin fill:#cce5ff,stroke:#007bff,stroke-width:2px;
-    classDef neck fill:#fff3cd,stroke:#ffc107,stroke-width:2px;
-    classDef head fill:#f8d7da,stroke:#dc3545,stroke-width:2px;
+    classDef input fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#000;
+    classDef backbone fill:#d4edda,stroke:#28a745,stroke-width:2px,color:#000;
+    classDef swin fill:#cce5ff,stroke:#007bff,stroke-width:2px,color:#000;
+    classDef neck fill:#fff3cd,stroke:#ffc107,stroke-width:2px,color:#000;
+    classDef head fill:#f8d7da,stroke:#dc3545,stroke-width:2px,color:#000;
     
     A[Input Image<br/>640x640]:::input --> B(Conv Layers P1/P2):::backbone
     B --> C(C3 Modules)
