@@ -63,8 +63,13 @@ from utils.torch_utils import (
     time_sync,
 )
 
+from models.swin_block import C3SWT
+from models.coord_attention import CoordAtt, CoordAttMulti
+from models.bifpn import BiFPNLayer
+
 try:
     import thop  # for FLOPs computation
+    thop = None  # Disable THOP temporarily as it crashes on multi-scale list outputs
 except ImportError:
     thop = None
 
@@ -421,24 +426,38 @@ def parse_model(d, ch):
             nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
+            C3SWT, CoordAttMulti, CoordAtt
         }:
             c1, c2 = ch[f], args[0]
+            if isinstance(c1, list): c1 = c1[0]  # Take first channel if input is a list
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, ch_mul)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
+            if m in {CoordAttMulti}:
+                c2 = [c2] * len(ch[f]) if isinstance(ch[f], list) else c2
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, C3SWT}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is BiFPNLayer:
+            c2 = args[0]
+            c2 = make_divisible(c2 * gw, ch_mul)
+            in_channels = [ch[x] for x in f]
+            args = [c2, in_channels, len(f)]
+            c2 = [c2] * len(f)
         # TODO: channel, gw, gd
         elif m in {Detect, Segment}:
-            args.append([ch[x] for x in f])
+            ch_ext = []
+            f_list = [f] if isinstance(f, int) else f
+            for x in f_list:
+                ch_ext.extend(ch[x]) if isinstance(ch[x], list) else ch_ext.append(ch[x])
+            args.append(ch_ext)
             if isinstance(args[1], int):  # number of anchors
-                args[1] = [list(range(args[1] * 2))] * len(f)
+                args[1] = [list(range(args[1] * 2))] * len(ch_ext)
             if m is Segment:
                 args[3] = make_divisible(args[3] * gw, ch_mul)
         elif m is Contract:
