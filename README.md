@@ -15,17 +15,49 @@
 
 ## Overview
 
-**DA-YOLO** (Deformable Attention YOLO) is a novel small-object detection framework that extends YOLOv5s with five principled architectural improvements, each motivated by the challenges of drone-captured and remote-sensing imagery:
+**DA-YOLO** (Deformable Attention YOLO) is a small-object detection framework that extends YOLOv5s with five principled architectural improvements, each motivated by the challenges of drone-captured and remote-sensing imagery:
 
 | # | Component | Where | What it solves |
 |---|---|---|---|
-| 1 | **DC3SWT** | Backbone + PANet neck | Fixed-window attention breaks on arbitrary object locations |
+| 1 | **DC3SWT** | Backbone P5 + PANet neck (P2–P4) | Fixed-window attention breaks on arbitrary object locations |
 | 2 | **WIoU v1** | Box regression loss | CIoU gives equal weight to easy and hard anchors |
 | 3 | **SE-BiFPN** | All 6 BiFPN fusion nodes | Channel redundancy after multi-path feature fusion |
 | 4 | **CoordAttMulti** | Detection head input | Spatial position lost in channel-only attention |
 | 5 | **4-Scale Head (P2–P5)** | Detection output | 3-scale head misses sub-8-pixel objects |
 
-The core inspiration is *"Swin-Transformer-Based YOLOv5 for Small-Object Detection in Remote Sensing Images"* (Sensors 2023, 23, 3634), extended by replacing fixed-window Swin attention with **Multi-Scale Deformable Attention** (MSDA, arxiv:2010.04159).
+Inspired by *"Swin-Transformer-Based YOLOv5 for Small-Object Detection in Remote Sensing Images"* (Sensors 2023, 23, 3634), extended by replacing fixed-window Swin attention with **Multi-Scale Deformable Attention** (MSDA, arxiv:2010.04159).
+
+---
+
+## Benchmarks
+
+### VisDrone2019-DET Validation Set (548 images)
+
+| Model | Params | GFLOPs | mAP@0.5 | mAP@0.5:0.95 | Precision | Recall | FPS |
+|---|---|---|---|---|---|---|---|
+| DA-YOLO v1 (epoch 131) | 5.54M | 35.52 | 25.64% | 13.96% | 0.380 | 0.310 | 36.8 |
+| DA-YOLO v2 (epoch 195) | 5.54M | 35.52 | 28.53% | 15.78% | 0.345 | 0.325 | 36.8 |
+| **DA-YOLO v2 + SAHI** | 5.54M | 35.52 | **30.85%** | **16.77%** | 0.632 | 0.279 | ~9.1 |
+
+> v2 trained 200 epochs from scratch with `copy_paste=0.5`, `anchor_t=3.5`, `iou_t=0.18`.  
+> SAHI: 1280px tiles, 25% overlap, avg 1.8 tiles/image, cross-patch NMS.
+
+### VisDrone Per-Class AP@0.5 — v2 + SAHI (best)
+
+| Class | AP@0.5 | AP@0.5:0.95 | Δ vs v1 |
+|---|---|---|---|
+| pedestrian | 52.84% | 23.31% | +6.24pp |
+| people | 36.42% | 12.53% | +5.12pp |
+| bicycle | 1.07% | 0.31% | −2.51pp |
+| **car** | **80.43%** | 52.54% | +1.63pp |
+| van | 16.99% | 11.98% | +6.53pp |
+| truck | 14.92% | 8.28% | +0.47pp |
+| tricycle | 9.70% | 5.13% | +2.98pp |
+| **awning-tricycle** | **17.06%** | 11.94% | **+13.94pp** (was 0%) |
+| bus | 31.52% | 22.56% | +6.05pp |
+| motor | 47.49% | 19.16% | +8.09pp |
+
+> Key win: `awning-tricycle` went from **0% → 17.06%** — solved by `copy_paste=0.5` augmentation synthesising rare-class instances.
 
 ---
 
@@ -35,13 +67,13 @@ The core inspiration is *"Swin-Transformer-Based YOLOv5 for Small-Object Detecti
 
 > `models/dc3swt.py` · `DC3SWT` and `MSDABlock` classes
 
-The standard Swin Transformer (used in `C3SWT`) partitions feature maps into fixed 8×8 windows and computes attention only within each window. This fails in remote-sensing imagery because:
+The standard Swin Transformer partitions feature maps into fixed 8×8 windows and computes attention only within each window. This fails in remote-sensing imagery because:
 
 - Small objects rarely align with pre-defined window boundaries
 - Dense clusters span multiple windows simultaneously
 - Objects appear at arbitrary locations and scales
 
-**DC3SWT** replaces the entire W-MSA + SW-MSA mechanism with **Multi-Scale Deformable Attention (MSDA)**. For each query location the network *learns where to look* by predicting M×K sampling offsets — allowing attention to span any spatial position, regardless of window boundaries.
+**DC3SWT** replaces the W-MSA + SW-MSA mechanism with **Multi-Scale Deformable Attention (MSDA)**. For each query location the network *learns where to look* by predicting M×K sampling offsets:
 
 ```
 For each query position q at (x_q, y_q):
@@ -52,7 +84,7 @@ For each query position q at (x_q, y_q):
   5. Project          output = W_o · out
 ```
 
-**Pure PyTorch — no custom CUDA extensions** (sampling via `F.grid_sample`).
+**Pure PyTorch — no custom CUDA extensions** (`F.grid_sample` handles bilinear sampling).
 
 | Property | C3SWT (baseline) | DC3SWT (proposed) |
 |---|---|---|
@@ -62,6 +94,8 @@ For each query position q at (x_q, y_q):
 | Small feature maps | Clamp window to min(H,W) | Clamp n_points to H×W |
 | Custom CUDA | No | No |
 | Parameters (YOLOv5s) | ~6.39M | ~5.64M (−11%) |
+
+DC3SWT is placed at **backbone P5** and at **all three PANet levels (P4, P3, P2)**, giving the network deformable attention throughout the feature hierarchy.
 
 ---
 
@@ -76,12 +110,12 @@ g   = exp(ρ² / c²)          where ρ = centre distance, c = enclosing diagona
 WIoU_loss = g × (1 − IoU)
 ```
 
-When ρ ≈ 0 (already well-centred), g ≈ 1 and the loss is identical to standard IoU loss.  
-When ρ is large relative to c (poor centring), g > 1 and the loss is amplified — forcing the network to fix geometrically poor predictions.
+When ρ ≈ 0 (well-centred), g ≈ 1 and loss equals standard IoU loss.
+When ρ is large (poor centring), g > 1 — forcing correction of geometrically poor predictions.
 
-This is particularly effective on VisDrone where the anchor set spans a 75× range of object sizes (4px–300px) and many anchors have large positional mismatches.
+This is particularly effective on VisDrone where the anchor set spans a 75× range (4px–300px) and many anchors have large positional mismatches.
 
-**Integration:** `bbox_iou()` returns `1 − g*(1−iou)`, so the existing `lbox += (1−iou).mean()` call site in `loss.py` works unchanged. Zero risk of call-site breakage.
+**Integration:** `bbox_iou()` returns `1 − g*(1−iou)`, so the existing `lbox += (1−iou).mean()` call site in `loss.py` works unchanged.
 
 ---
 
@@ -89,16 +123,14 @@ This is particularly effective on VisDrone where the anchor set spans a 75× ran
 
 > `models/bifpn.py` · `SEBlock` class · `BiFPNLayer(use_se=True)`
 
-After BiFPN weighted fusion, different channels carry features from paths with very different spatial histories (backbone skip, top-down, bottom-up). Standard convolution treats all output channels equally, wasting capacity on redundant or suppressed paths.
-
-**SEBlock** (Squeeze-and-Excitation, Hu et al. CVPR 2018) applies lightweight channel recalibration after every fusion convolution:
+After BiFPN weighted fusion, different channels carry features from paths with very different spatial histories. **SEBlock** applies lightweight channel recalibration after every fusion convolution:
 
 ```
 scale = Sigmoid( Linear(SiLU(Linear(AvgPool2d(x)))) )
 output = x × scale
 ```
 
-Placed at **all 6 BiFPN fusion nodes** (p4_td, p3_td, p2_out, p3_out, p4_out, p5_out) for systematic coverage. Total cost: ~49K parameters at C=256 (< 1% of model). Set `use_se=False` to use `nn.Identity` passthrough at zero cost.
+Placed at **all 6 BiFPN fusion nodes** (p4_td, p3_td, p2_out, p3_out, p4_out, p5_out). Total cost: ~49K parameters at C=256 (<1% of model). Set `use_se=False` to use `nn.Identity` passthrough at zero cost.
 
 ---
 
@@ -106,68 +138,112 @@ Placed at **all 6 BiFPN fusion nodes** (p4_td, p3_td, p2_out, p3_out, p4_out, p5
 
 > `models/coord_attention.py` · `CoordAttMulti` class
 
-Standard channel attention (SE) pools spatial information entirely, losing positional context. **Coordinate Attention** (Hou et al. CVPR 2021) decomposes spatial pooling into H-axis and W-axis directional pooling, preserving directional position information:
+Standard channel attention (SE) pools spatial information entirely, losing positional context. **Coordinate Attention** decomposes spatial pooling into H-axis and W-axis directional pooling, preserving position information:
 
 ```
 x_h = AvgPool(x, kernel=(1,W))  → (B,C,H,1)
 x_w = AvgPool(x, kernel=(H,1))  → (B,C,1,W)
 ```
 
-`CoordAttMulti` applies one CA layer per detection scale (P2, P3, P4, P5), injecting spatial position information immediately before the detection head. This is **orthogonal to SE** — SE recalibrates channels after fusion; CoordAtt encodes spatial position before detection.
+`CoordAttMulti` applies one CA layer per detection scale (P2, P3, P4, P5), injecting position information immediately before the detection head. **Orthogonal to SE** — SE recalibrates channels after fusion; CoordAtt encodes spatial position before detection.
 
 ---
 
 ### 5. 4-Scale Detection Head (P2–P5)
 
-Standard YOLOv5 uses 3 detection scales (P3/P4/P5, strides 8/16/32). The minimum detectable object at stride 8 and 640px input is approximately 8×8 pixels. For VisDrone where objects can be as small as 2–4 pixels, this is insufficient.
+Standard YOLOv5 uses 3 scales (P3/P4/P5, strides 8/16/32). Minimum detectable object at stride 8 is ~8×8px. On VisDrone objects can be 2–4px.
 
-DA-YOLO adds a **P2 ultra-high-resolution head** at stride 4:
-
-| Head | Stride | Object size range | VisDrone context |
+| Head | Stride | Object range | Dataset example |
 |---|---|---|---|
-| P2 | 4 | 2–16 px | Pedestrians, bicycles at distance |
+| P2 | 4 | 2–16 px | Pedestrians/bicycles at distance (VisDrone) |
 | P3 | 8 | 16–48 px | Small vehicles, people |
 | P4 | 16 | 48–128 px | Vehicles, buses |
-| P5 | 32 | 128+ px | Large vehicles, buses |
+| P5 | 32 | 128+ px | Large vehicles, airport runways (DIOR-R) |
 
-DCNv2 is placed **exclusively at the P3 output BiFPN node** because P3 is the only node that simultaneously receives three distinct spatial paths (backbone skip, top-down from P4/P5, bottom-up from P2) — the highest geometric misalignment junction. At P4/P5 the benefit diminishes while the +150K parameter cost is constant.
+DCNv2 is placed **exclusively at the P3 BiFPN output** — the only node receiving three distinct spatial paths simultaneously (backbone skip, top-down from P4/P5, bottom-up from P2), giving the highest alignment benefit-to-cost ratio.
 
 ---
 
 ## Architecture Diagram
 
+```mermaid
+flowchart TB
+    IMG["🖼️ Input Image\n(any resolution)"]
+
+    subgraph BB["Backbone — YOLOv5s-CSP + DC3SWT"]
+        direction TB
+        C0["Conv 6×6/2  →  P1/2"]
+        C1["Conv 3×3/2  →  P2/4\n128ch"]
+        C2["C3 × 3"]
+        C3["Conv 3×3/2  →  P3/8\n256ch"]
+        C4["C3 × 6"]
+        C5["Conv 3×3/2  →  P4/16\n512ch"]
+        C6["C3 × 9"]
+        C7["Conv 3×3/2  →  P5/32\n1024ch"]
+        C8["DC3SWT × 3\n🔵 MSDA @ P5"]
+        C9["SPPF"]
+        C0-->C1-->C2-->C3-->C4-->C5-->C6-->C7-->C8-->C9
+    end
+
+    subgraph TD["PANet Top-Down — DC3SWT at every level"]
+        direction LR
+        TD1["Conv + Upsample\nP5 → P4 scale"]
+        TD2["DC3SWT × 3\n🔵 MSDA @ P4"]
+        TD3["Conv + Upsample\nP4 → P3 scale"]
+        TD4["DC3SWT × 3\n🔵 MSDA @ P3"]
+        TD5["Conv + Upsample\nP3 → P2 scale"]
+        TD6["DC3SWT × 3\n🔵 MSDA @ P2"]
+        TD1-->TD2-->TD3-->TD4-->TD5-->TD6
+    end
+
+    subgraph BFN["SE-BiFPN Cross-Scale Fusion"]
+        direction TB
+        BF1["BiFPN Node — p4_td\n⚡ SEBlock"]
+        BF2["BiFPN Node — p3_td\n⚡ SEBlock + DCNv2"]
+        BF3["BiFPN Node — p2_out\n⚡ SEBlock"]
+        BF4["BiFPN Node — p3_out\n⚡ SEBlock + DCNv2"]
+        BF5["BiFPN Node — p4_out\n⚡ SEBlock"]
+        BF6["BiFPN Node — p5_out\n⚡ SEBlock"]
+    end
+
+    subgraph CA["CoordAttMulti — per-scale position encoding"]
+        direction LR
+        CA2["CoordAtt P2"]
+        CA3["CoordAtt P3"]
+        CA4["CoordAtt P4"]
+        CA5["CoordAtt P5"]
+    end
+
+    subgraph DH["4-Scale Detection Heads"]
+        direction LR
+        H2["Head P2\nstride 4\ntiny 2–16px"]
+        H3["Head P3\nstride 8\nsmall 16–48px"]
+        H4["Head P4\nstride 16\nmedium 48–128px"]
+        H5["Head P5\nstride 32\nlarge 128+px"]
+    end
+
+    OUT["📦 Detections\n(class, bbox, conf)"]
+
+    IMG --> BB
+    BB --> TD
+    C2 -->|"P2 skip"| BFN
+    C4 -->|"P3 skip"| BFN
+    C6 -->|"P4 skip"| BFN
+    C9 -->|"P5 SPPF"| BFN
+    TD --> BFN
+    BFN --> CA
+    CA2 --> H2
+    CA3 --> H3
+    CA4 --> H4
+    CA5 --> H5
+    H2 & H3 & H4 & H5 --> OUT
 ```
-Input Image (any resolution)
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  YOLOv5s-CSP Backbone                                           │
-│  Conv → C3 → Conv → C3 → Conv → C3 → Conv → DC3SWT → SPPF     │
-│   P1/2   P2/4        P3/8        P4/16        P5/32             │
-└──────────┬──────────┬─────────────┬────────────────────────────┘
-           │ P2       │ P3          │ P4              │ P5 (SPPF)
-           │          │             │                  │
-┌──────────▼──────────▼─────────────▼──────────────────▼─────────┐
-│  PANet Top-Down Pathway (DC3SWT at every level)                 │
-│  P5 → upsample+concat(P4) → DC3SWT → upsample+concat(P3)      │
-│     → DC3SWT → upsample+concat(P2) → DC3SWT                   │
-└──────────┬──────────┬─────────────┬────────────────────────────┘
-           │ P2_td    │ P3_td       │ P4_td           │ P5
-           │          │             │                  │
-┌──────────▼──────────▼─────────────▼──────────────────▼─────────┐
-│  BiFPN Cross-Scale Fusion (SE channel attention, DCNv2 @ P3)   │
-│  6 weighted fusion nodes with SEBlock recalibration            │
-│  DeformConv at P3_out for 3-way junction alignment             │
-└──────────┬──────────┬─────────────┬────────────────────────────┘
-           │ P2_out   │ P3_out      │ P4_out          │ P5_out
-           │          │             │                  │
-┌──────────▼──────────▼─────────────▼──────────────────▼─────────┐
-│  CoordAttMulti (per-scale Coordinate Attention)                 │
-└──────────┬──────────┬─────────────┬────────────────────────────┘
-           │          │             │                  │
-        Head P2    Head P3       Head P4            Head P5
-       (tiny)     (small)       (medium)            (large)
-```
+
+**Legend:**
+- 🔵 **DC3SWT**: Multi-Scale Deformable Attention (MSDA) — replaces fixed Swin windows
+- ⚡ **SEBlock**: Squeeze-Excitation channel recalibration at each BiFPN fusion node
+- **DCNv2**: Deformable Conv at P3 BiFPN node (highest spatial misalignment junction)
+- **CoordAtt**: H/W-directional pooling — preserves spatial position before detection
 
 ---
 
@@ -175,7 +251,7 @@ Input Image (any resolution)
 
 ```bash
 git clone <this-repo>
-cd DASwin-YOLO
+cd DA-YOLO
 
 python3 -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
@@ -183,7 +259,7 @@ source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 # Key packages: torch>=1.12, torchvision>=0.13, timm>=0.9.0
 
-# Verify all components (no pytest required)
+# Verify all components
 venv/bin/python3 tests/test_components.py
 # Expected: 36/36 passed — All tests passed! ✅
 ```
@@ -194,232 +270,303 @@ venv/bin/python3 tests/test_components.py
 
 ### VisDrone2019-DET
 
-VisDrone is a drone-captured aerial dataset with 10 object classes. The detection split contains 6,471 training images, 548 validation images, and 1,610 test-dev images at 1920×1080 resolution.
+10-class drone-captured dataset. 6,471 train / 548 val / 1,610 test images at 1920×1080.
 
-**Step 1 — Download the dataset**
-
-The dataset is hosted on Google Drive via the official VisDrone GitHub at https://github.com/VisDrone/VisDrone-Dataset. Use `gdown` to download directly from the command line:
+**Download**
 
 ```bash
 pip install gdown
-
 mkdir -p /data/VisDrone && cd /data/VisDrone
 
-# VisDrone2019-DET — train, val, test-dev
 gdown --fuzzy "https://drive.google.com/file/d/1a2oHjcEcwXP8oUF9gaL7xyqMYwkigTe0" -O VisDrone2019-DET-train.zip
 gdown --fuzzy "https://drive.google.com/file/d/1bxK5zgLn0_L8x276eKkuYA_FzwCIjb59" -O VisDrone2019-DET-val.zip
-gdown --fuzzy "https://drive.google.com/file/d/1PFdW_VFSCfZ_sTSZAGjZggiC9qfpfMm3" -O VisDrone2019-DET-test-dev.zip
 
-unzip VisDrone2019-DET-train.zip
-unzip VisDrone2019-DET-val.zip
-unzip VisDrone2019-DET-test-dev.zip
+unzip VisDrone2019-DET-train.zip && unzip VisDrone2019-DET-val.zip
 ```
 
-If `gdown` fails (Google Drive quota), download the three zip files manually from the VisDrone GitHub and place them under `/data/VisDrone/`.
-
-After extraction the tree should be:
-```
-/data/VisDrone/
-  VisDrone2019-DET-train/
-    images/       *.jpg
-    annotations/  *.txt
-  VisDrone2019-DET-val/
-    images/
-    annotations/
-  VisDrone2019-DET-test-dev/
-    images/
-    annotations/  (may be empty)
-```
-
-**Step 2 — Convert to YOLO format**
+**Convert → YOLO format**
 
 ```bash
-cd /path/to/DASwin-YOLO
-
 venv/bin/python3 utils/visdrone_converter.py \
     --root /data/VisDrone \
     --out  /data/VisDrone/yolo
+# → 6471 train images, 548 val images, 10 classes
 ```
 
-Output tree under `/data/VisDrone/yolo/`:
-```
-images/
-  train/    *.jpg  (6471 images)
-  val/      *.jpg  (548 images)
-  test-dev/ *.jpg  (1610 images)
-labels/
-  train/    *.txt  (YOLO format)
-  val/      *.txt
-  test-dev/ *.txt  (empty if no annotations)
-```
-
-Category mapping: VisDrone class 0 (ignored) and 11 (others) are skipped. Classes 1–10 map to YOLO IDs 0–9 (pedestrian, people, bicycle, car, van, truck, tricycle, awning-tricycle, bus, motor).
-
-**Step 3 — Update dataset yaml**
-
-Edit `data/visdrone.yaml` and set the `path` field:
-```yaml
-path: /data/VisDrone/yolo   # ← set to your --out path
-```
-
-**Step 4 — Re-cluster anchors (strongly recommended)**
-
-VisDrone objects span 4px–300px — very different from the COCO default anchors. Re-clustering with CIOU distance gives a significant mAP boost:
+**Re-cluster anchors**
 
 ```bash
 venv/bin/python3 utils/ciou_kmeans.py \
     --label-dir /data/VisDrone/yolo/labels/train \
-    --img-size 1280 \
-    --n-clusters 12
+    --img-size 1280 --n-clusters 12
+# Paste output into models/da_yolo.yaml anchors section
+```
 
-# Paste the printed anchors into models/da_yolo.yaml anchors section
+**Update dataset yaml** (`data/visdrone.yaml`):
+```yaml
+path: /data/VisDrone/yolo
 ```
 
 ---
 
-### DOTA v1.0 HBB (Horizontal Bounding Boxes)
+### DIOR-R
 
-DOTA is a large-scale dataset for object detection in aerial images (2806 images, 15 categories, up to 4000×4000 pixels). DA-YOLO currently supports the HBB (axis-aligned box) variant.
+20-class remote sensing dataset. 11,725 images at fixed 800×800px — no tiling required.  
+Publicly available on Google Drive: https://gcheng-nwpu.github.io/#Datasets
 
-**Step 1 — Download**
-
-Register and download from the official DOTA page: https://captain-whu.github.io/DOTA/dataset.html
-
-Download `DOTA-v1.0_train.zip` and `DOTA-v1.0_val.zip`.
-
-**Step 2 — Tile the images**
-
-DOTA images are too large for direct training (up to 4000×4000). They must be tiled into 1024×1024 patches with 200px overlap:
+**Download**
 
 ```bash
-venv/bin/python3 utils/dota_tiler.py \
-    --root   /data/DOTA \
-    --out    /data/DOTA/yolo \
-    --size   1024 \
-    --stride 824
+pip install gdown
 
-# Note: utils/dota_tiler.py is planned — see roadmap below
+# Download all four zips from the DIOR-R dataset page, then:
+unzip Annotations.zip    -d /data/DIOR-R/
+unzip ImageSets.zip      -d /data/DIOR-R/ImageSets/
+unzip JPEGImages-trainval.zip -d /data/DIOR-R/
 ```
 
-**Step 3 — Train**
+Expected structure after extraction:
+```
+/data/DIOR-R/
+  Annotations/
+    Horizontal Bounding Boxes/   *.xml   ← 20,000 annotation files
+    Oriented Bounding Boxes/     *.xml   (OBB — not used currently)
+  ImageSets/
+    Main/  train.txt  val.txt  test.txt
+  JPEGImages-trainval/  *.jpg   (11,725 images)
+```
+
+**Convert → YOLO format**
+
+The converter auto-detects the `Horizontal Bounding Boxes` subdirectory:
+
+```bash
+venv/bin/python3 utils/dior_converter.py \
+    --root /data/DIOR-R \
+    --out  /data/DIOR-R/yolo \
+    --splits train val
+# → 5862 train + 5863 val images / 68,070 boxes / 20 classes
+```
+
+**Re-cluster anchors for 800px**
+
+```bash
+venv/bin/python3 utils/ciou_kmeans.py \
+    --label-dir /data/DIOR-R/yolo/labels/train \
+    --img-size 800 --n-clusters 12
+# Paste output into models/da_yolo_dior.yaml
+```
+
+**Train**
+
+```bash
+venv/bin/python3 train_da_yolo.py \
+    --data data/dior.yaml \
+    --cfg  models/da_yolo_dior.yaml \
+    --hyp  data/hyps/hyp.dior.yaml \
+    --mode scratch \
+    --img-size 800 \
+    --batch-size 8 \
+    --name dior_scratch
+```
+
+---
+
+### DOTA 1.5 (pre-tiled)
+
+16-class aerial dataset. Pre-tiled 1024×1024px patches — no tiling step needed.  
+Source: https://captain-whu.github.io/DOTA/dataset.html
+
+The provided zips contain already-tiled images paired with OBB labels (8-coordinate polygon format). `dota_hbb_converter.py` converts OBB → axis-aligned HBB directly from zip — no intermediate extraction needed.
+
+```
+DOTA_dataset/
+  lebel/train/train.zip       ← 10,595 images + OBB labels (mixed in one zip)
+  lebel/val/val_label.zip     ← 3,360 images + OBB labels
+  test/test.zip               ← images only (no labels)
+  val/val.zip                 ← images only (duplicate of val_label.zip images)
+```
+
+**Convert OBB → YOLO HBB** (processes zip directly, saves ~17GB of temp disk space)
+
+```bash
+venv/bin/python3 utils/dota_hbb_converter.py \
+    --train-zip DOTA_dataset/lebel/train/train.zip \
+    --val-zip   DOTA_dataset/lebel/val/val_label.zip \
+    --out       /data/DOTA/yolo
+# → 10,595 train + 3,360 val images / 413,524 boxes / 16 classes
+```
+
+OBB → HBB conversion:
+```
+Input:  class_id  x1 y1  x2 y2  x3 y3  x4 y4   (normalised polygon corners)
+Output: class_id  cx cy  w  h                    (axis-aligned enclosing box)
+
+cx = (min_x + max_x) / 2      w = max_x - min_x
+cy = (min_y + max_y) / 2      h = max_y - min_y
+```
+
+**Re-cluster anchors for 1024px tiles**
+
+```bash
+venv/bin/python3 utils/ciou_kmeans.py \
+    --label-dir /data/DOTA/yolo/labels/train \
+    --img-size 1024 --n-clusters 12
+# Paste output into models/da_yolo_dota.yaml
+```
+
+**Train**
 
 ```bash
 venv/bin/python3 train_da_yolo.py \
     --data data/dota.yaml \
+    --cfg  models/da_yolo_dota.yaml \
+    --hyp  data/hyps/hyp.dota.yaml \
     --mode scratch \
     --img-size 1024 \
-    --batch-size 4
+    --batch-size 4 \
+    --name dota_scratch
 ```
-
-> DOTA tiling script and `data/dota.yaml` are on the roadmap. Contributions welcome.
-
----
-
-### DIOR-R (Oriented Bounding Boxes)
-
-DIOR-R is a remote sensing detection dataset with 20 categories and oriented annotations (OBB). OBB support requires an angle regression head extension and is planned as a future addition to DA-YOLO.
-
-Current status: DIOR-R HBB (converting OBB to HBB by taking the bounding box of the polygon) can be trained immediately. Full OBB head support is on the roadmap.
 
 ---
 
 ## Training
 
-### Fine-tune mode (pretrained backbone, recommended starting point)
+### Quick-start
 
 ```bash
-# VisDrone — fine-tune, lr=1e-6, 100 epochs, cosine LR
-venv/bin/python3 train_da_yolo.py \
-    --data data/visdrone.yaml \
-    --mode finetune \
-    --img-size 1280
-
-# Override batch size and epochs
-venv/bin/python3 train_da_yolo.py \
-    --data data/visdrone.yaml \
-    --mode finetune \
-    --img-size 1280 \
-    --batch-size 8 \
-    --epochs 150
-```
-
-### From-scratch mode (no pretrained weights)
-
-```bash
-# VisDrone — from-scratch, lr=1e-4, 150 epochs, WIoU loss
+# VisDrone — from scratch (recommended)
+tmux new -s visdrone
 venv/bin/python3 train_da_yolo.py \
     --data data/visdrone.yaml \
     --mode scratch \
-    --img-size 1280
+    --img-size 1280 \
+    --batch-size 4 \
+    --name visdrone_scratch
 
-# DOTA
+# DIOR-R — from scratch
+tmux new -s dior
+venv/bin/python3 train_da_yolo.py \
+    --data data/dior.yaml \
+    --cfg  models/da_yolo_dior.yaml \
+    --hyp  data/hyps/hyp.dior.yaml \
+    --mode scratch \
+    --img-size 800 \
+    --batch-size 8 \
+    --name dior_scratch
+
+# DOTA 1.5 — from scratch
+tmux new -s dota
 venv/bin/python3 train_da_yolo.py \
     --data data/dota.yaml \
+    --cfg  models/da_yolo_dota.yaml \
+    --hyp  data/hyps/hyp.dota.yaml \
     --mode scratch \
     --img-size 1024 \
-    --batch-size 4
+    --batch-size 4 \
+    --name dota_scratch
 ```
+
+### Training defaults
+
+| Setting | Fine-tune | From-scratch |
+|---|---|---|
+| Initial LR | 1e-6 | 1e-4 |
+| Epochs | 100 | 200 |
+| Early stop patience | 30 | 100 |
+| Label smoothing | 0.1 | 0.0 |
+| Close-mosaic (last N epochs) | 10 | 20 |
+| Optimizer | AdamW | AdamW |
+| LR scheduler | Cosine | Cosine |
+| Loss type | WIoU v1 | WIoU v1 |
+
+### Training hardening (all active by default)
+
+| Feature | Detail |
+|---|---|
+| **AdamW optimizer** | Required for Transformer blocks — SGD causes gradient spikes |
+| **ValLoss early stopping** | Stops on val-loss plateau (more stable than mAP on dense datasets) |
+| **NaN loss guard** | Skips non-finite batches, protects optimizer momentum buffers |
+| **Gradient clip** | `max_norm=1.0` — standard for Transformer-based models |
+| **Close-mosaic** | Disables heavy augmentation for final N epochs (stabilises convergence) |
+| **Cosine LR + DropPath=0.1** | Smooth convergence for Swin/MSDA Transformer training |
+| **WIoU v1 loss** | Geometric focus factor down-weights easy anchors |
+| **SE channel attention** | Recalibrates BiFPN fusion output channels |
 
 ### Resume from checkpoint
 
 ```bash
 venv/bin/python3 train_da_yolo.py \
     --data data/visdrone.yaml \
-    --resume runs/da_yolo/exp/weights/last.pt
+    --resume runs/da_yolo/visdrone_scratch/weights/last.pt
 ```
 
-### Long-running training (recommended: tmux)
+---
+
+## SAHI Inference (Slicing Aided Hyper Inference)
+
+SAHI improves detection of small objects by dividing each image into overlapping tiles, running inference on each tile, then merging detections with cross-patch NMS.
 
 ```bash
-tmux new -s da_yolo
-venv/bin/python3 train_da_yolo.py --data data/visdrone.yaml --mode scratch --img-size 1280
-# Detach: Ctrl+B, D — re-attach: tmux attach -t da_yolo
+# Evaluate with SAHI on VisDrone val set
+venv/bin/python3 evaluate_visdrone_sahi.py \
+    --weights runs/da_yolo/visdrone_v22/weights/best.pth \
+    --data    data/visdrone.yaml \
+    --tile-size  1280 \
+    --model-size 1280 \
+    --overlap    0.25 \
+    --out-dir    eval_results/my_sahi_run
 ```
 
-### Training defaults summary
+Key flags:
 
-| Setting | Fine-tune | From-scratch |
+| Flag | Default | Description |
 |---|---|---|
-| Initial LR | 1e-6 | 1e-4 |
-| Epochs | 100 | 150 |
-| Early stop patience | 30 | 80 |
-| Label smoothing | 0.1 | 0.0 |
-| Close-mosaic (last N epochs) | 10 | 20 |
-| Optimizer | AdamW | AdamW |
-| LR scheduler | Cosine | Cosine |
-| Batch size | 4 | 4 |
-| Image size | 1024 | 1024 |
-| Loss type | WIoU v1 | WIoU v1 |
+| `--tile-size` | 1280 | Crop size from original image |
+| `--model-size` | 1280 | Model input size (tile is letterboxed to this) |
+| `--overlap` | 0.25 | Fractional tile overlap |
+| `--conf-thres` | 0.001 | Detection confidence threshold |
+| `--iou-thres` | 0.45 | NMS IoU threshold |
 
-### Training hardening (all active by default via `train_da_yolo.py`)
+**How it works:**
 
-| Feature | Detail |
-|---|---|
-| **AdamW optimizer** | Required for Transformer blocks — SGD causes gradient spikes |
-| **ValLoss early stopping** | Stops on validation loss plateau, not mAP (more stable on dense datasets) |
-| **NaN loss guard** | Skips non-finite batches to protect optimizer momentum buffers |
-| **Gradient clip** | `max_norm=1.0` — standard for Transformer-based models |
-| **Close-mosaic** | Disables heavy augmentation for final N epochs (YOLOv8 trick) |
-| **Cosine LR + DropPath=0.1** | Smooth convergence for Swin Transformer-based training |
-| **WIoU v1 loss** | Geometric focus factor down-weights easy anchors |
-| **SE channel attention** | Recalibrates BiFPN fusion output channels |
+```mermaid
+flowchart LR
+    A["Original Image\n(e.g. 1920×1080)"]
+    B["compute_tiles()\nSlice into overlapping crops\n(avg 1.8 tiles for 1280px)"]
+    C["infer_tile()\nLetterbox crop → model input\nRun DA-YOLO forward pass"]
+    D["Map boxes back\nto full-image coords"]
+    E["cross_patch_nms()\nGreedy class-aware NMS\nacross all tile detections"]
+    F["Final Detections\n+ mAP evaluation"]
+    A-->B-->C-->D-->E-->F
+```
+
+**SAHI tile-size comparison on VisDrone v2:**
+
+| Tile size | Scale factor | mAP@0.5 | Notes |
+|---|---|---|---|
+| 640px | ×2.0 upscale | 22.69% | Hurts — objects exceed anchor range |
+| 800px | ×1.6 upscale | 26.40% | Marginal gain |
+| **1280px** | ×1.0 (no upscale) | **30.85%** | Best — preserves anchor distribution |
+
+> SAHI gains are largest when the model was trained at a much smaller input than the image resolution. For a 1280px-trained model on 1920×1080 images (1.5× scale), the gain is moderate (+2.3pp). For 640px models on 4000×4000 images the gain can be 5–10pp.
 
 ---
 
 ## Evaluation
 
 ```bash
-# Validate on VisDrone val split
+# Standard validation (no SAHI)
 venv/bin/python3 val.py \
-    --data data/visdrone.yaml \
-    --weights runs/da_yolo/exp/weights/best.pt \
+    --data    data/visdrone.yaml \
+    --weights runs/da_yolo/visdrone_v22/weights/best.pth \
     --img-size 1280 \
     --batch-size 8
 
-# Generate COCO-format JSON for submission
+# Generate COCO-format JSON for leaderboard submission
 venv/bin/python3 val.py \
-    --data data/visdrone.yaml \
-    --weights runs/da_yolo/exp/weights/best.pt \
+    --data    data/visdrone.yaml \
+    --weights runs/da_yolo/visdrone_v22/weights/best.pth \
     --img-size 1280 \
     --save-json
 ```
@@ -429,28 +576,24 @@ venv/bin/python3 val.py \
 ## Inference
 
 ```bash
-# Inference on a single image
+# Single image
 venv/bin/python3 detect.py \
-    --weights runs/da_yolo/exp/weights/best.pt \
+    --weights runs/da_yolo/visdrone_v22/weights/best.pth \
     --source  /path/to/image.jpg \
     --img-size 1280 \
     --conf-thres 0.25 \
     --iou-thres 0.45
 
-# Inference on a directory
+# Directory
 venv/bin/python3 detect.py \
-    --weights runs/da_yolo/exp/weights/best.pt \
-    --source  /path/to/images/ \
-    --img-size 1280
+    --weights runs/da_yolo/visdrone_v22/weights/best.pth \
+    --source  /path/to/images/
 
-# Inference on video
+# Video
 venv/bin/python3 detect.py \
-    --weights runs/da_yolo/exp/weights/best.pt \
+    --weights runs/da_yolo/visdrone_v22/weights/best.pth \
     --source  /path/to/video.mp4 \
     --img-size 1280
-
-# SLD (Stained-Laminate Defect) inference — uses dedicated inference code
-# See inference_code/ directory for SLD-specific scripts
 ```
 
 ---
@@ -460,14 +603,14 @@ venv/bin/python3 detect.py \
 ```bash
 # Export to ONNX (for deployment)
 venv/bin/python3 export.py \
-    --weights runs/da_yolo/exp/weights/best.pt \
+    --weights runs/da_yolo/visdrone_v22/weights/best.pth \
     --include onnx \
     --img-size 1280 \
     --batch-size 1
 
 # Export to TorchScript
 venv/bin/python3 export.py \
-    --weights runs/da_yolo/exp/weights/best.pt \
+    --weights runs/da_yolo/visdrone_v22/weights/best.pth \
     --include torchscript
 ```
 
@@ -475,61 +618,40 @@ venv/bin/python3 export.py \
 
 ## Ablation Table
 
-All variants use the same `models/da_yolo.yaml` config, controlled by hyp yaml flags and architecture arguments.
-
 | Variant | Backbone attention | BiFPN SE | Loss | Params | Notes |
 |---|---|---|---|---|---|
 | YOLOv5s baseline | C3 bottleneck | — | CIoU | ~7.0M | Reference |
-| + C3SWT neck | W-MSA + SW-MSA | — | CIoU | ~6.39M | Fixed-window Swin |
-| + DC3SWT | **MSDA (learned offsets)** | — | CIoU | ~5.64M | This work — deformable |
-| + WIoU | MSDA | — | **WIoU v1** | ~5.64M | Geometric loss focus |
+| + C3SWT | W-MSA + SW-MSA | — | CIoU | ~6.39M | Fixed-window Swin |
+| + DC3SWT | **MSDA (learned offsets)** | — | CIoU | ~5.64M | This work |
+| + WIoU | MSDA | — | **WIoU v1** | ~5.64M | Geometric loss |
 | + SE-BiFPN | MSDA | **SEBlock × 6** | WIoU | ~5.69M | Channel recalibration |
-| **DA-YOLO (full)** | **MSDA** | **SEBlock × 6** | **WIoU v1** | **~5.69M** | **All components** |
+| **DA-YOLO (full)** | **MSDA** | **SEBlock × 6** | **WIoU v1** | **~5.54M** | **All components** |
 
-> fp16 inference halves memory: DA-YOLO fits in ~10.7 MB at fp16.  
-> All counts at `nc=80`, `width_multiple=0.50`.  
-> Actual mAP values are dataset-dependent — train and evaluate on your dataset.
+> Counts at `nc=80`, `width_multiple=0.50`. Actual mAP values are dataset-dependent.
 
 ---
 
-## Generate Dataset-Specific Anchors
+## Dataset-Specific Model Configurations
 
-The default anchors are scaled for COCO objects. For any new dataset (especially VisDrone with its tiny objects) re-clustering dramatically improves recall:
+Each dataset has a dedicated model yaml with anchors clustered from its training labels:
 
-```bash
-venv/bin/python3 utils/ciou_kmeans.py \
-    --label-dir /data/VisDrone/yolo/labels/train \
-    --img-size 1280 \
-    --n-clusters 12
+| Model yaml | Dataset | Anchors (BPR@0.5) | Image size |
+|---|---|---|---|
+| `models/da_yolo.yaml` | VisDrone | 0.9551 | 1280px |
+| `models/da_yolo_dior.yaml` | DIOR-R | 0.9223 (0.999 at AutoAnchor) | 800px |
+| `models/da_yolo_dota.yaml` | DOTA 1.5 | 0.9619 | 1024px |
 
-# Paste the printed anchors block into models/da_yolo.yaml, replacing the anchors: section
-```
-
----
-
-## Custom Dataset
+Select the correct model yaml via `--cfg` when training:
 
 ```bash
-# Copy the dataset template
-cp data/da_yolo_template.yaml data/my_dataset.yaml
+# VisDrone (default)
+venv/bin/python3 train_da_yolo.py --data data/visdrone.yaml
 
-# Edit my_dataset.yaml:
-#   path:  /path/to/dataset
-#   train: images/train
-#   val:   images/val
-#   nc:    <number of classes>
-#   names: { 0: class_a, 1: class_b, ... }
+# DIOR-R (must specify cfg and hyp)
+venv/bin/python3 train_da_yolo.py --data data/dior.yaml --cfg models/da_yolo_dior.yaml --hyp data/hyps/hyp.dior.yaml
 
-# Regenerate anchors for your object size distribution
-venv/bin/python3 utils/ciou_kmeans.py \
-    --label-dir /path/to/dataset/labels/train \
-    --img-size 1024 \
-    --n-clusters 12
-
-# Train
-venv/bin/python3 train_da_yolo.py \
-    --data data/my_dataset.yaml \
-    --mode scratch
+# DOTA 1.5 (must specify cfg and hyp)
+venv/bin/python3 train_da_yolo.py --data data/dota.yaml --cfg models/da_yolo_dota.yaml --hyp data/hyps/hyp.dota.yaml
 ```
 
 ---
@@ -538,65 +660,140 @@ venv/bin/python3 train_da_yolo.py \
 
 | File | Purpose |
 |---|---|
-| `models/da_yolo.yaml` | **DA-YOLO architecture config (primary)** |
-| `models/dc3swt.py` | `DC3SWT` + `MSDABlock` — pure-PyTorch deformable attention |
-| `models/swin_block.py` | `C3SWT` — CSP + Swin window attention (ablation baseline) |
+| `models/da_yolo.yaml` | **Architecture config — VisDrone anchors** |
+| `models/da_yolo_dior.yaml` | Architecture config — DIOR-R anchors (800px) |
+| `models/da_yolo_dota.yaml` | Architecture config — DOTA 1.5 anchors (1024px) |
+| `models/dc3swt.py` | `DC3SWT` + `MSDABlock` — deformable attention (pure PyTorch) |
+| `models/swin_block.py` | `C3SWT` — fixed-window Swin (ablation baseline) |
 | `models/bifpn.py` | `BiFPNLayer` — BiFPN with DCNv2 @ P3 and SEBlock at all 6 nodes |
 | `models/coord_attention.py` | `CoordAtt` + `CoordAttMulti` — Coordinate Attention |
-| `utils/metrics.py` | `bbox_iou()` with WIoU v1 flag (`WIoU=True`) |
+| `utils/metrics.py` | `bbox_iou()` with WIoU v1 flag |
 | `utils/loss.py` | `ComputeLoss` — activates WIoU via `loss_type: wiou` in hyp yaml |
 | `utils/ciou_kmeans.py` | CIOU anchor clustering for dataset-specific anchors |
-| `utils/visdrone_converter.py` | VisDrone2019-DET → YOLO format converter |
-| `train_da_yolo.py` | **Primary training launcher** (wraps train.py with best-practice defaults) |
-| `train.py` | Core YOLOv5 training loop (used internally by train_da_yolo.py) |
-| `val.py` | Evaluation script |
+| `utils/visdrone_converter.py` | VisDrone2019-DET → YOLO format |
+| `utils/dior_converter.py` | DIOR-R VOC XML HBB → YOLO format (auto-detects HBB subdirectory) |
+| `utils/dota_hbb_converter.py` | DOTA 1.5 OBB (8-coord) → YOLO HBB — reads directly from zip |
+| `utils/dota_tiler.py` | Tiler for raw DOTA images (not needed for pre-tiled data) |
+| `train_da_yolo.py` | **Primary training launcher** — best-practice defaults, all datasets |
+| `train.py` | Core YOLOv5 training loop (used internally) |
+| `evaluate_visdrone_sahi.py` | SAHI evaluation with cross-patch NMS and per-class AP reporting |
+| `val.py` | Standard evaluation script |
 | `detect.py` | Inference script |
 | `export.py` | Export to ONNX / TorchScript |
-| `data/da_yolo_template.yaml` | Dataset template — copy and fill for your data |
 | `data/visdrone.yaml` | VisDrone2019-DET dataset config |
-| `data/hyps/hyp.da-yolo.yaml` | Hyperparameters for fine-tuning (lr=1e-6, WIoU) |
-| `data/hyps/hyp.visdrone.yaml` | Hyperparameters tuned for VisDrone (lr=1e-4, focal loss, copy-paste) |
+| `data/dior.yaml` | DIOR-R dataset config (20 classes, 800px) |
+| `data/dota.yaml` | DOTA 1.5 dataset config (16 classes, 1024px) |
+| `data/da_yolo_template.yaml` | Dataset template for custom datasets |
+| `data/hyps/hyp.visdrone.yaml` | VisDrone hyps (lr=1e-4, fl_gamma=1.5, copy_paste=0.5) |
+| `data/hyps/hyp.dior.yaml` | DIOR-R hyps (lr=1e-4, fl_gamma=0.0, label_smoothing=0.1) |
+| `data/hyps/hyp.dota.yaml` | DOTA 1.5 hyps (lr=1e-4, fl_gamma=1.5, obj=0.7) |
+| `data/hyps/hyp.da-yolo.yaml` | Generic fine-tune hyps (lr=1e-6) |
 | `tests/test_components.py` | 36-test component suite (standalone, no pytest required) |
-| `inference_code/` | SLD (Stained-Laminate Defect) inference scripts |
-| `inference_dataset/` | SLD inference dataset |
-| `data/daswinyolo_sld.yaml` | SLD dataset config |
 
 ---
 
 ## Hyperparameter Reference
 
-### `data/hyps/hyp.da-yolo.yaml` (fine-tune, generic)
+### `data/hyps/hyp.visdrone.yaml` — VisDrone from-scratch
 
 | Key | Value | Rationale |
 |---|---|---|
-| `lr0` | 1e-6 | Conservative: avoids catastrophic forgetting when fine-tuning pretrained backbone |
-| `lrf` | 0.01 | Cosine anneals to 1e-8 |
-| `weight_decay` | 0.05 | AdamW standard |
+| `lr0` | 1e-4 | From-scratch training |
+| `obj` | 1.5 | Up-weighted: many tiny 2–16px objects at P2 head |
+| `fl_gamma` | 1.5 | Focal loss: severe car >> pedestrian >> bicycle imbalance |
+| `copy_paste` | **0.5** | Aggressive: synthesises rare-class (awning-tricycle, bicycle) instances |
+| `anchor_t` | **3.5** | Looser matching: helps rare tiny classes with borderline anchors |
+| `iou_t` | **0.18** | Accept lower IoU match for rare/tiny classes |
+| `lrf` | 0.005 | Deeper cosine annealing |
+| `scale` | 0.5 | Scale jitter ±50%: objects span 4px–300px |
 | `loss_type` | wiou | WIoU v1 geometric loss |
-| `label_smoothing` | 0.1 | Prevents overconfident predictions |
 
-### `data/hyps/hyp.visdrone.yaml` (VisDrone from-scratch)
+> **v1 → v2 changes**: `copy_paste 0.3→0.5`, `anchor_t 4.0→3.5`, `iou_t 0.20→0.18`, `lrf 0.01→0.005`. These together moved awning-tricycle from 0% → 4.56% (then to 17.06% with SAHI).
+
+### `data/hyps/hyp.dior.yaml` — DIOR-R from-scratch
 
 | Key | Value | Rationale |
 |---|---|---|
-| `lr0` | 1e-4 | Higher LR for from-scratch; VisDrone has no good pretrained init |
-| `obj` | 1.5 | Up-weighted objectness: VisDrone has many tiny 2–16px objects at P2 head |
-| `fl_gamma` | 1.5 | Focal loss active: severe car >> pedestrian >> bus class imbalance |
-| `copy_paste` | 0.3 | Aggressive copy-paste: pads sparse background regions with objects |
-| `scale` | 0.5 | Scale jitter ±50%: objects span 4px–300px range |
+| `lr0` | 1e-4 | From-scratch training |
+| `fl_gamma` | 0.0 | Class imbalance is mild in DIOR-R — focal loss disabled |
+| `copy_paste` | 0.3 | Moderate — DIOR-R is reasonably balanced |
+| `scale` | 0.3 | Less jitter — all images are 800×800, objects are stable |
+| `label_smoothing` | 0.1 | DIOR-R annotations are cleaner than VisDrone |
+| `obj` | 1.0 | Objects are larger and clearer — standard weight |
 | `loss_type` | wiou | WIoU v1 geometric loss |
-| `label_smoothing` | 0.0 | Keep positives sharp for densely occluded objects |
-| `degrees` | 0.0 | No rotation: aerial view is fixed-orientation |
+
+### `data/hyps/hyp.dota.yaml` — DOTA 1.5 from-scratch
+
+| Key | Value | Rationale |
+|---|---|---|
+| `lr0` | 1e-4 | From-scratch training |
+| `fl_gamma` | 1.5 | Severe imbalance: small-vehicle >> harbor/roundabout |
+| `obj` | 0.7 | Background dominates aerial tiles — reduce obj weight |
+| `copy_paste` | 0.4 | Helps rare classes: helicopter, container-crane |
+| `flipud` | 0.5 | Aerial imagery has top/bottom symmetry |
+| `scale` | 0.5 | Objects vary within tiles |
+| `loss_type` | wiou | WIoU v1 geometric loss |
+
+---
+
+## Generate Dataset-Specific Anchors
+
+```bash
+# VisDrone (1280px)
+venv/bin/python3 utils/ciou_kmeans.py \
+    --label-dir /data/VisDrone/yolo/labels/train \
+    --img-size 1280 --n-clusters 12
+
+# DIOR-R (800px)
+venv/bin/python3 utils/ciou_kmeans.py \
+    --label-dir /data/DIOR-R/yolo/labels/train \
+    --img-size 800 --n-clusters 12
+
+# DOTA 1.5 (1024px)
+venv/bin/python3 utils/ciou_kmeans.py \
+    --label-dir /data/DOTA/yolo/labels/train \
+    --img-size 1024 --n-clusters 12
+```
+
+Paste the printed anchor block into the corresponding `models/da_yolo_<dataset>.yaml`.
+
+---
+
+## Custom Dataset
+
+```bash
+cp data/da_yolo_template.yaml data/my_dataset.yaml
+# Edit: path, train, val, nc, names
+
+venv/bin/python3 utils/ciou_kmeans.py \
+    --label-dir /path/to/dataset/labels/train \
+    --img-size 1024 --n-clusters 12
+
+venv/bin/python3 train_da_yolo.py \
+    --data data/my_dataset.yaml \
+    --mode scratch
+```
 
 ---
 
 ## Roadmap
 
-- [ ] DOTA tiling script (`utils/dota_tiler.py`) and `data/dota.yaml`
+- [x] DC3SWT: MSDA replacing fixed-window Swin (backbone P5 + all PANet levels)
+- [x] SE-BiFPN: SEBlock at all 6 BiFPN fusion nodes
+- [x] WIoU v1: geometric box regression loss
+- [x] CoordAttMulti: per-scale coordinate attention at detection head
+- [x] 4-scale head: P2/P3/P4/P5 (stride 4/8/16/32)
+- [x] CIOU k-means anchor clustering (`utils/ciou_kmeans.py`)
+- [x] VisDrone2019-DET training + evaluation (mAP@0.5: 30.85% with SAHI)
+- [x] SAHI evaluation script with cross-patch NMS (`evaluate_visdrone_sahi.py`)
+- [x] DIOR-R dataset support (`utils/dior_converter.py`, `data/dior.yaml`, `models/da_yolo_dior.yaml`)
+- [x] DOTA 1.5 OBB→HBB converter (`utils/dota_hbb_converter.py`, `data/dota.yaml`, `models/da_yolo_dota.yaml`)
+- [x] Dataset-specific hyp yamls for VisDrone, DIOR-R, DOTA 1.5
+- [ ] DIOR-R benchmark results (training in progress — `runs/da_yolo/dior_scratch3`)
+- [ ] DOTA 1.5 benchmark results (queued after DIOR-R)
 - [ ] DIOR-R OBB head extension (angle regression branch)
-- [ ] VisDrone benchmark results table (mAP@0.5, mAP@0.5:0.95)
-- [ ] Mosaic + copy-paste integration for DOTA tiled training
 - [ ] fp16 / TensorRT export validation on VisDrone
+- [ ] SAHI evaluation script for DIOR-R and DOTA
 
 ---
 
@@ -612,30 +809,36 @@ P3_out = conv(  w₁·P3_original          ← lateral skip from backbone
               + w₃·P2_out_downsampled   ← bottom-up signal from high-res P2  )
 ```
 
-These tensors originate from different receptive fields and sampling geometries. DCNv2's learned offsets correct this misalignment adaptively. P4/P5 have proportionally smaller misalignment at lower resolution. Each `DeformConvBlock` adds ~150K params — placing it at P3 only gives the highest benefit-to-cost ratio.
+These tensors originate from different receptive fields and sampling geometries. DCNv2's learned offsets correct this misalignment. P4/P5 have proportionally smaller misalignment at lower resolution. Each `DeformConvBlock` adds ~150K params — placing it at P3 only gives the best benefit-to-cost ratio.
 
 ### Why single-level MSDA in DC3SWT?
 
 Deformable DETR uses multi-level MSDA (L=4 feature levels) because the decoder needs global cross-scale context. DC3SWT operates within a single pyramid level because:
-- The surrounding BiFPN already handles cross-scale aggregation
+- The surrounding BiFPN handles cross-scale aggregation
 - Multi-level sampling would multiply memory by L=4 inside each block
 - "Multi-scale" in DC3SWT refers to M heads × K sampling points within a single level, not cross-level attention
 
 ### Why SE in BiFPN rather than CoordAtt?
 
-SE and CoordAtt are complementary. SE handles **channel redundancy** after feature fusion — deciding which channels to emphasise. CoordAtt encodes **spatial position** for the detection head. Both are needed; placing SE in BiFPN and CoordAtt at head input avoids duplication.
+SE and CoordAtt are complementary. SE handles **channel redundancy** after feature fusion. CoordAtt encodes **spatial position** for the detection head. Placing SE in BiFPN and CoordAtt at head input avoids duplication and addresses both problems where they occur.
+
+### Why SAHI gains are small on VisDrone?
+
+SAHI's 5–10pp gains in literature come from 640px models evaluated on 4000×4000 images — a ×6.25 scale ratio. DA-YOLO is trained at 1280px on 1920×1080 VisDrone images (×1.5 ratio). Objects are already at the correct scale for the model, so tiling provides only modest gain (+2.3pp). For DOTA at 1024px tiles the gain is expected to be similarly bounded since data is already pre-tiled.
 
 ---
 
 ## References
 
 - **Paper (inspiration)**: Gong, H. et al. *Swin-Transformer-Based YOLOv5 for Small-Object Detection in Remote Sensing Images.* Sensors 2023, 23, 3634. [DOI:10.3390/s23073634](https://doi.org/10.3390/s23073634)
-- **Deformable DETR / MSDA**: Zhu, X. et al. *Deformable DETR: Deformable Transformers for End-to-End Object Detection.* ICLR 2021. [arxiv:2010.04159](https://arxiv.org/abs/2010.04159)
+- **MSDA / Deformable DETR**: Zhu, X. et al. *Deformable DETR: Deformable Transformers for End-to-End Object Detection.* ICLR 2021. [arxiv:2010.04159](https://arxiv.org/abs/2010.04159)
 - **WIoU v1**: Tong, Z. et al. *Wise-IoU: Bounding Box Regression Loss with Dynamic Focusing Mechanism.* AAAI 2023. [arxiv:2301.10051](https://arxiv.org/abs/2301.10051)
-- **Squeeze-and-Excitation**: Hu, J. et al. *Squeeze-and-Excitation Networks.* CVPR 2018. [arxiv:1709.01507](https://arxiv.org/abs/1709.01507)
+- **SE Networks**: Hu, J. et al. *Squeeze-and-Excitation Networks.* CVPR 2018. [arxiv:1709.01507](https://arxiv.org/abs/1709.01507)
 - **Swin Transformer**: Liu, Z. et al. *Swin Transformer: Hierarchical Vision Transformer using Shifted Windows.* ICCV 2021. [arxiv:2103.14030](https://arxiv.org/abs/2103.14030)
 - **BiFPN / EfficientDet**: Tan, M. et al. *EfficientDet: Scalable and Efficient Object Detection.* CVPR 2020. [arxiv:1911.09070](https://arxiv.org/abs/1911.09070)
 - **Coordinate Attention**: Hou, Q. et al. *Coordinate Attention for Efficient Mobile Network Design.* CVPR 2021. [arxiv:2103.02907](https://arxiv.org/abs/2103.02907)
 - **DCNv2**: Zhu, X. et al. *Deformable ConvNets v2: More Deformable, Better Results.* CVPR 2019. [arxiv:1811.11168](https://arxiv.org/abs/1811.11168)
 - **VisDrone**: Zhu, P. et al. *VisDrone-DET2019: The Vision Meets Drone Object Detection in Image Challenge Results.* ICCVW 2019. [github.com/VisDrone](https://github.com/VisDrone/VisDrone-Dataset)
+- **DIOR-R**: Cheng, G. et al. *Object Detection in Optical Remote Sensing Images.* ISPRS 2020. [gcheng-nwpu.github.io](https://gcheng-nwpu.github.io/#Datasets)
+- **DOTA**: Xia, G. et al. *DOTA: A Large-Scale Dataset for Object Detection in Aerial Images.* CVPR 2018. [captain-whu.github.io/DOTA](https://captain-whu.github.io/DOTA/dataset.html)
 - **YOLOv5**: Jocher, G. et al. Ultralytics YOLOv5. [github.com/ultralytics/yolov5](https://github.com/ultralytics/yolov5)
