@@ -31,7 +31,7 @@ Inspired by *"Swin-Transformer-Based YOLOv5 for Small-Object Detection in Remote
 
 ## Benchmarks
 
-### VisDrone2019-DET Validation Set (548 images)
+### VisDrone2019-DET Validation Set (548 images, 10 classes)
 
 | Model | Params | GFLOPs | mAP@0.5 | mAP@0.5:0.95 | Precision | Recall | FPS |
 |---|---|---|---|---|---|---|---|
@@ -58,6 +58,34 @@ Inspired by *"Swin-Transformer-Based YOLOv5 for Small-Object Detection in Remote
 | motor | 47.49% | 19.16% | +8.09pp |
 
 > Key win: `awning-tricycle` went from **0% → 17.06%** — solved by `copy_paste=0.5` augmentation synthesising rare-class instances.
+
+---
+
+### DIOR-R Validation Set (5863 images, 20 classes, 800×800)
+
+| Model | Params | GFLOPs | mAP@0.5 | mAP@0.5:0.95 | Precision | Recall | FPS |
+|---|---|---|---|---|---|---|---|
+| **DA-YOLO (epoch 144)** | **5.55M** | **14.08** | **60.00%** | **37.00%** | **0.666** | **0.583** | **62.6** |
+
+> 200 epochs from scratch · 800px · batch 8 · `hyp.dior.yaml` · `models/da_yolo_dior.yaml`  
+> Eval: `eval_results/dior_v1/`  — GFLOPs at 800px; same weights give 35.52 GFLOPs at 1280px.
+
+### DIOR-R Per-Class AP@0.5 (20 classes)
+
+| Class | AP@0.5 | AP@0.5:0.95 | | Class | AP@0.5 | AP@0.5:0.95 |
+|---|---|---|---|---|---|---|
+| **airplane** | **91.17%** | 65.16% | | golffield | 39.76% | 13.12% |
+| **baseballfield** | **91.92%** | 76.14% | | groundtrackfield | 51.39% | 34.66% |
+| **ship** | **90.18%** | 50.08% | | harbor | 36.35% | 16.23% |
+| **tenniscourt** | **88.85%** | 75.77% | | overpass | 39.94% | 19.12% |
+| **chimney** | **86.75%** | 63.11% | | expressway-service | 51.99% | 24.04% |
+| stadium | 80.54% | 44.41% | | expressway-toll | 55.59% | 36.62% |
+| storagetank | 78.74% | 59.72% | | vehicle | 68.26% | 39.84% |
+| basketballcourt | 75.62% | 55.54% | | windmill | 72.42% | 30.15% |
+| bridge | 29.52% | 12.62% | | airport | 28.72% | 10.10% |
+| dam | 25.11% | 8.44% | | **trainstation** | **17.18%** | 5.22% |
+
+> Strong: geometric/regular structures (fields, courts, tanks). Weak: complex/variable structures (train stations, dams, bridges).
 
 ---
 
@@ -161,6 +189,148 @@ Standard YOLOv5 uses 3 scales (P3/P4/P5, strides 8/16/32). Minimum detectable ob
 | P5 | 32 | 128+ px | Large vehicles, airport runways (DIOR-R) |
 
 DCNv2 is placed **exclusively at the P3 BiFPN output** — the only node receiving three distinct spatial paths simultaneously (backbone skip, top-down from P4/P5, bottom-up from P2), giving the highest alignment benefit-to-cost ratio.
+
+---
+
+## Mathematical Formulations
+
+This section provides the complete mathematical definitions for all trainable components in DA-YOLO, intended as a paper-writing reference.
+
+---
+
+### 1. Multi-Scale Deformable Attention (MSDA) — DC3SWT
+
+Given input feature map $\mathbf{x} \in \mathbb{R}^{C \times H \times W}$, query $q$ at spatial location $(x_q, y_q)$, and normalized reference point $\mathbf{p}_q = (x_q/W,\; y_q/H) \in [0,1]^2$:
+
+$$\text{MSDA}(q,\,\mathbf{p}_q,\,\mathbf{x}) = \sum_{m=1}^{M} W_m \left[\sum_{k=1}^{K} A_{mqk} \cdot \phi\!\left(\mathbf{x}_m,\;\mathbf{p}_q + \Delta\mathbf{p}_{mqk}\right)\right]$$
+
+| Symbol | Definition |
+|---|---|
+| $M$ | Number of attention heads ($M=8$ in DC3SWT) |
+| $K$ | Sampling points per head ($K=4$) |
+| $\Delta\mathbf{p}_{mqk} \in (-0.5,\,0.5)^2$ | Learned 2D offset — predicted by a linear layer then tanh-clamped |
+| $A_{mqk}$ | Attention weight; $\sum_{k=1}^{K} A_{mqk} = 1$ (softmax across $K$) |
+| $\phi(\mathbf{x}_m, \cdot)$ | Bilinear sampling — implemented as `F.grid_sample` (no custom CUDA) |
+| $W_m \in \mathbb{R}^{C_v \times C_v}$ | Per-head output projection matrix |
+
+Offsets $\Delta\mathbf{p}$ and attention weights $A$ are predicted jointly from the query features:
+
+$$\left[\Delta\mathbf{p}_{m1},\ldots,\Delta\mathbf{p}_{mK},\; A_{m1},\ldots,A_{mK}\right] = \text{Linear}_{3MK}(q)$$
+
+The $3MK$ projection outputs $2MK$ offset coordinates and $MK$ raw attention logits (softmax-normalized per head). This is the key distinction from fixed Swin windows: sampling locations are data-dependent, not grid-aligned.
+
+---
+
+### 2. WIoU v1 — Geometric Focusing Loss
+
+**Geometric focusing factor:**
+
+$$g = \exp\!\left(\frac{\rho^2}{c^2}\right)$$
+
+where $\rho = \|\mathbf{c}_{\text{pred}} - \mathbf{c}_{\text{gt}}\|_2$ is the Euclidean distance between predicted and ground-truth box centres, and $c$ is the diagonal length of the smallest enclosing box.
+
+**WIoU regression loss:**
+
+$$\mathcal{L}_{\text{WIoU}} = g \cdot (1 - \text{IoU})$$
+
+**Behaviour:**
+
+| Anchor quality | $\rho$ | $g$ | Effect |
+|---|---|---|---|
+| Well-centred (easy) | $\rho \approx 0$ | $g \approx 1$ | Reduces to standard IoU loss |
+| Poorly-centred (hard) | $\rho \gg 0$ | $g \gg 1$ | Amplifies gradient — forces correction |
+
+Integration: `bbox_iou(WIoU=True)` returns $-(g \cdot \text{IoU} - g + 1)$ so the standard `lbox += (1 - iou).mean()` call site works unchanged. Activated via `loss_type: wiou` in any hyp yaml.
+
+---
+
+### 3. SE-BiFPN — BiFPN Weighted Fusion + SE Channel Recalibration
+
+**BiFPN fast normalized weighted fusion:**
+
+$$\mathbf{O} = \text{Conv}\!\left(\sum_{i=1}^{N} \frac{w_i}{\varepsilon + \sum_{j=1}^{N} w_j} \cdot \mathbf{I}_i\right), \quad w_i = \text{ReLU}(\hat{w}_i)$$
+
+where $\hat{w}_i$ are learnable scalars initialized to 1 and $\varepsilon = 10^{-4}$ ensures numerical stability. The three-input P3_out fusion (the only node receiving backbone skip + top-down + bottom-up paths simultaneously) is:
+
+$$P_3^{\text{out}} = \text{DConv}\!\left(\frac{w_1 P_3 + w_2 P_3^{\text{td}} + w_3\,\text{Up}(P_2^{\text{out}})}{w_1 + w_2 + w_3 + \varepsilon}\right)$$
+
+where $\text{DConv}$ denotes Deformable Conv v2 (DCNv2) — placed exclusively at P3 because this node has the highest spatial misalignment from three distinct receptive-field paths.
+
+**SE channel recalibration** — applied after every BiFPN fusion convolution at all 6 nodes:
+
+Squeeze (global average pooling):
+$$\mathbf{z}_c = \frac{1}{H \times W} \sum_{i=1}^{H} \sum_{j=1}^{W} x_{c,i,j}$$
+
+Excitation (bottleneck MLP):
+$$\mathbf{s} = \sigma\!\left(W_2\, \delta\!\left(W_1 \mathbf{z}\right)\right), \quad W_1 \in \mathbb{R}^{C/r \times C},\; W_2 \in \mathbb{R}^{C \times C/r}$$
+
+where $\delta$ is SiLU activation, $\sigma$ is sigmoid, and $r = 16$ (reduction ratio).
+
+Recalibration:
+$$\hat{\mathbf{x}}_{c,i,j} = x_{c,i,j} \cdot s_c$$
+
+Cost: $2C^2/r$ parameters per SE block — ≈49K at $C=256$ (<1% of total model parameters).
+
+---
+
+### 4. CoordAttMulti — Coordinate Attention
+
+Standard channel attention (SE) collapses both spatial dimensions — losing position information. CoordAtt decomposes spatial pooling into two 1D operations along H and W axes separately.
+
+**Directional pooling:**
+
+$$z^h_c(i) = \frac{1}{W}\sum_{j=1}^{W} x_c(i,j) \in \mathbb{R}^{H}, \qquad z^w_c(j) = \frac{1}{H}\sum_{i=1}^{H} x_c(i,j) \in \mathbb{R}^{W}$$
+
+**Joint encoding** (concatenate along spatial axis, encode with shared Conv):
+
+$$\mathbf{f} = \delta\!\left(\text{BN}\!\left(W_1 \cdot \text{concat}\!\left[\mathbf{z}^h,\; (\mathbf{z}^w)^\top\right]\right)\right) \in \mathbb{R}^{C' \times (H+W)}$$
+
+**Split and gate:**
+
+$$\mathbf{f}^h,\; \mathbf{f}^w = \text{split}(\mathbf{f},\;\text{dim}=H)$$
+
+$$\mathbf{g}^h = \sigma(W_h\, \mathbf{f}^h) \in \mathbb{R}^{C \times H}, \qquad \mathbf{g}^w = \sigma(W_w\, \mathbf{f}^w) \in \mathbb{R}^{C \times W}$$
+
+**Output** (element-wise modulation preserving 2D position):
+
+$$\hat{x}_{c,i,j} = x_{c,i,j} \cdot g^h_c(i) \cdot g^w_c(j)$$
+
+`CoordAttMulti` instantiates one CA layer per detection scale (P2, P3, P4, P5) — injecting positional gates immediately before each detection head.
+
+---
+
+### 5. CIOU K-means Anchor Clustering
+
+Standard IoU-based k-means (YOLOv5) uses $d = 1 - \text{IoU}$ as the clustering distance. DA-YOLO uses **CIoU distance** to account for both box overlap and aspect ratio:
+
+$$d(\mathbf{a},\,\mathbf{b}) = 1 - \text{CIoU}(\mathbf{a},\,\mathbf{b})$$
+
+$$\text{CIoU}(\mathbf{a},\,\mathbf{b}) = \text{IoU} - \frac{\rho^2}{c^2} - \alpha\, v$$
+
+where:
+- $\rho = \|\mathbf{c}_a - \mathbf{c}_b\|_2$: centre distance; $c$: enclosing diagonal  
+- $v = \frac{4}{\pi^2}\!\left(\arctan\frac{w^{\text{gt}}}{h^{\text{gt}}} - \arctan\frac{w}{h}\right)^{\!2}$: aspect-ratio consistency term  
+- $\alpha = \frac{v}{(1-\text{IoU})+v}$: trade-off coefficient
+
+**Cluster assignment:**
+
+$$k^*(b) = \arg\min_{k \in \{1,\ldots,K\}} d(\mathbf{a}_k,\,\mathbf{b})$$
+
+CIoU distance is specifically shape-aware — anchors clustered with it yield better Best Possible Recall (BPR) than IoU-only clustering for elongated objects (vehicles, runways, bridges).
+
+---
+
+### 6. Total Training Loss
+
+$$\mathcal{L} = \lambda_{\text{box}}\,\mathcal{L}_{\text{box}} + \lambda_{\text{obj}}\,\mathcal{L}_{\text{obj}} + \lambda_{\text{cls}}\,\mathcal{L}_{\text{cls}}$$
+
+| Term | Formula | Default weight |
+|---|---|---|
+| $\mathcal{L}_{\text{box}}$ | $\mathcal{L}_{\text{WIoU}} = g \cdot (1 - \text{IoU})$ | $\lambda_{\text{box}} = 0.05$ |
+| $\mathcal{L}_{\text{obj}}$ | $\text{BCE}(\hat{p}_{\text{obj}},\, t_{\text{obj}})$ with focal scaling | $\lambda_{\text{obj}} = 1.0$ |
+| $\mathcal{L}_{\text{cls}}$ | $\text{BCE}(\hat{p}_{\text{cls}},\, t_{\text{cls}})$ per class | $\lambda_{\text{cls}} = 0.5$ |
+
+Objectness target $t_{\text{obj}} = \text{IoU}(\text{pred}, \text{gt})$ (soft label — standard YOLOv5). All heads (P2–P5) contribute to $\mathcal{L}$; P2 uses the smallest anchors, so its objectness gradient is most sensitive to the `obj` weight in `hyp.yaml`.
 
 ---
 
@@ -789,8 +959,8 @@ venv/bin/python3 train_da_yolo.py \
 - [x] DIOR-R dataset support (`utils/dior_converter.py`, `data/dior.yaml`, `models/da_yolo_dior.yaml`)
 - [x] DOTA 1.5 OBB→HBB converter (`utils/dota_hbb_converter.py`, `data/dota.yaml`, `models/da_yolo_dota.yaml`)
 - [x] Dataset-specific hyp yamls for VisDrone, DIOR-R, DOTA 1.5
-- [ ] DIOR-R benchmark results (training in progress — `runs/da_yolo/dior_scratch3`)
-- [ ] DOTA 1.5 benchmark results (queued after DIOR-R)
+- [x] DIOR-R benchmark results — **60.00% mAP@0.5** (`runs/da_yolo/dior_scratch3`, epoch 144)
+- [ ] DOTA 1.5 benchmark results (training in progress — `runs/da_yolo/dota_scratch`)
 - [ ] DIOR-R OBB head extension (angle regression branch)
 - [ ] fp16 / TensorRT export validation on VisDrone
 - [ ] SAHI evaluation script for DIOR-R and DOTA
